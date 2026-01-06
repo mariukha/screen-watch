@@ -1,0 +1,11 @@
+# User configuration (contains secrets!)
+config.json
+
+# Python artifacts
+__pycache__/
+*.pyc
+venv/
+.env
+
+# MacOS system files
+.DS_Store
