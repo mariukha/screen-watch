@@ -44,6 +44,46 @@ def to_pixmap(img):
     data = img.convert("RGBA").tobytes("raw", "BGRA")
     return QPixmap.fromImage(QImage(data, img.size[0], img.size[1], QImage.Format.Format_ARGB32))
 
+class TelegramListener(QThread):
+    log = pyqtSignal(str, str)
+    screenshot_requested = pyqtSignal()
+    
+    def __init__(self, token, chat):
+        super().__init__()
+        self.token, self.chat = token, chat
+        self.running = True
+        self.offset = 0
+    
+    def run(self):
+        self.log.emit("Telegram listener started", "ok")
+        while self.running:
+            try:
+                r = requests.get(
+                    f"https://api.telegram.org/bot{self.token}/getUpdates",
+                    params={'offset': self.offset, 'timeout': 10},
+                    timeout=15
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get('ok'):
+                        for update in data.get('result', []):
+                            self.offset = update['update_id'] + 1
+                            msg = update.get('message', {})
+                            text = msg.get('text', '').strip().lower()
+                            chat_id = str(msg.get('chat', {}).get('id', ''))
+                            if text == '!screen' and chat_id == str(self.chat):
+                                self.log.emit("Screenshot requested via Telegram", "warn")
+                                self.screenshot_requested.emit()
+            except Exception as e:
+                if self.running:
+                    self.log.emit(f"Listener error: {e}", "err")
+                    time.sleep(5)
+    
+    def stop(self):
+        self.running = False
+        self.wait(3000)
+
+
 class Monitor(QThread):
     log = pyqtSignal(str, str)
     changed = pyqtSignal(object, int)
@@ -166,6 +206,7 @@ class Main(QMainWindow):
         self.cfg = Config.load()
         self.mon = None
         self.sel = None
+        self.listener = None
         self._ui()
         self._tray()
         self._region()
@@ -363,13 +404,44 @@ class Main(QMainWindow):
         self.mon.status.connect(lambda s: self.st.setText(s))
         self.mon.changed.connect(lambda img, _: self.pv.set(img))
         self.mon.start()
+        
+        # Start Telegram listener
+        self.listener = TelegramListener(tok, chat)
+        self.listener.log.connect(self._log)
+        self.listener.screenshot_requested.connect(self._send_screenshot)
+        self.listener.start()
+        
         self.startb.setEnabled(False); self.stopb.setEnabled(True); self.selb.setEnabled(False)
         self.tok.setEnabled(False); self.chat.setEnabled(False); self.testb.setEnabled(False)
         self.dot.setStyleSheet("color:#4ec9b0;font-size:12px;")
         self.st.setText("Active"); self.st.setStyleSheet("color:#4ec9b0;font-size:12px;")
     
+    def _send_screenshot(self):
+        """Send screenshot when requested via Telegram command"""
+        r = self.cfg.get("region")
+        tok, chat = self.cfg.get("token"), self.cfg.get("chat")
+        try:
+            img = screenshot(tuple(r) if r else None)
+            self.pv.set(img)
+            bio = BytesIO()
+            img.save(bio, 'PNG')
+            bio.seek(0)
+            res = requests.post(
+                f"https://api.telegram.org/bot{tok}/sendPhoto",
+                data={'chat_id': chat, 'caption': f"📸 Screenshot | {datetime.now().strftime('%H:%M:%S')}"},
+                files={'photo': ('screen.png', bio, 'image/png')},
+                timeout=30
+            )
+            if res.status_code == 200:
+                self._log("Screenshot sent via command", "ok")
+            else:
+                self._log(f"Failed to send screenshot: {res.text}", "err")
+        except Exception as e:
+            self._log(f"Screenshot error: {e}", "err")
+    
     def _stop(self):
         if self.mon: self.mon.stop(); self.mon = None
+        if self.listener: self.listener.stop(); self.listener = None
         self._log("Stopped", "info")
         self.startb.setEnabled(True); self.stopb.setEnabled(False); self.selb.setEnabled(True)
         self.tok.setEnabled(True); self.chat.setEnabled(True); self.testb.setEnabled(True)
