@@ -47,6 +47,7 @@ def to_pixmap(img):
 class TelegramListener(QThread):
     log = pyqtSignal(str, str)
     screenshot_requested = pyqtSignal()
+    stop_requested = pyqtSignal()
     
     def __init__(self, token, chat):
         super().__init__()
@@ -71,13 +72,27 @@ class TelegramListener(QThread):
                             msg = update.get('message', {})
                             text = msg.get('text', '').strip().lower()
                             chat_id = str(msg.get('chat', {}).get('id', ''))
-                            if text == '!screen' and chat_id == str(self.chat):
-                                self.log.emit("Screenshot requested via Telegram", "warn")
-                                self.screenshot_requested.emit()
+                            if chat_id == str(self.chat):
+                                if text == '!screen':
+                                    self.log.emit("Screenshot requested via Telegram", "warn")
+                                    self.screenshot_requested.emit()
+                                elif text == '!stop':
+                                    self.log.emit("Stop requested via Telegram", "warn")
+                                    self._send_message("🛑 Monitoring stopped")
+                                    self.stop_requested.emit()
             except Exception as e:
                 if self.running:
                     self.log.emit(f"Listener error: {e}", "err")
                     time.sleep(5)
+    
+    def _send_message(self, text):
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{self.token}/sendMessage",
+                data={'chat_id': self.chat, 'text': text},
+                timeout=10
+            )
+        except: pass
     
     def stop(self):
         self.running = False
@@ -409,6 +424,7 @@ class Main(QMainWindow):
         self.listener = TelegramListener(tok, chat)
         self.listener.log.connect(self._log)
         self.listener.screenshot_requested.connect(self._send_screenshot)
+        self.listener.stop_requested.connect(self._stop)
         self.listener.start()
         
         self.startb.setEnabled(False); self.stopb.setEnabled(True); self.selb.setEnabled(False)
