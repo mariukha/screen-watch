@@ -48,15 +48,18 @@ class TelegramListener(QThread):
     log = pyqtSignal(str, str)
     screenshot_requested = pyqtSignal()
     stop_requested = pyqtSignal()
+    start_requested = pyqtSignal()
     
-    def __init__(self, token, chat):
+    def __init__(self, token, chat, idle_mode=False):
         super().__init__()
         self.token, self.chat = token, chat
         self.running = True
         self.offset = 0
+        self.idle_mode = idle_mode  # True = only listen for !start
     
     def run(self):
-        self.log.emit("Telegram listener started", "ok")
+        mode = "idle" if self.idle_mode else "active"
+        self.log.emit(f"Telegram listener started ({mode})", "ok")
         while self.running:
             try:
                 r = requests.get(
@@ -73,13 +76,21 @@ class TelegramListener(QThread):
                             text = msg.get('text', '').strip().lower()
                             chat_id = str(msg.get('chat', {}).get('id', ''))
                             if chat_id == str(self.chat):
-                                if text == '!screen':
-                                    self.log.emit("Screenshot requested via Telegram", "warn")
-                                    self.screenshot_requested.emit()
-                                elif text == '!stop':
-                                    self.log.emit("Stop requested via Telegram", "warn")
-                                    self._send_message("🛑 Monitoring stopped")
-                                    self.stop_requested.emit()
+                                if self.idle_mode:
+                                    # Only respond to !start when idle
+                                    if text == '!start':
+                                        self.log.emit("Start requested via Telegram", "warn")
+                                        self._send_message("▶️ Monitoring started")
+                                        self.start_requested.emit()
+                                else:
+                                    # Active mode - respond to !screen and !stop
+                                    if text == '!screen':
+                                        self.log.emit("Screenshot requested via Telegram", "warn")
+                                        self.screenshot_requested.emit()
+                                    elif text == '!stop':
+                                        self.log.emit("Stop requested via Telegram", "warn")
+                                        self._send_message("🛑 Monitoring stopped")
+                                        self.stop_requested.emit()
             except Exception as e:
                 if self.running:
                     self.log.emit(f"Listener error: {e}", "err")
@@ -222,9 +233,11 @@ class Main(QMainWindow):
         self.mon = None
         self.sel = None
         self.listener = None
+        self.idle_listener = None
         self._ui()
         self._tray()
         self._region()
+        self._start_idle_listener()
     
     def _ui(self):
         w = QWidget()
@@ -408,9 +421,17 @@ class Main(QMainWindow):
     
     def _start(self):
         r = self.cfg.get("region")
-        if not r: QMessageBox.warning(self, "Error", "Select region first!"); return
-        tok, chat = self.tok.text().strip(), self.chat.text().strip()
-        if not tok or not chat: QMessageBox.warning(self, "Error", "Enter Token and Chat ID!"); return
+        if not r:
+            self._log("Cannot start: no region selected", "err")
+            return
+        tok, chat = self.tok.text().strip() or self.cfg.get("token", ""), self.chat.text().strip() or self.cfg.get("chat", "")
+        if not tok or not chat:
+            self._log("Cannot start: no Token or Chat ID", "err")
+            return
+        
+        # Stop idle listener first
+        self._stop_idle_listener()
+        
         self.cfg["token"], self.cfg["chat"] = tok, chat
         self.cfg["threshold"], self.cfg["interval"] = self.thr.value(), self.intv.value()
         Config.save(self.cfg)
@@ -420,8 +441,8 @@ class Main(QMainWindow):
         self.mon.changed.connect(lambda img, _: self.pv.set(img))
         self.mon.start()
         
-        # Start Telegram listener
-        self.listener = TelegramListener(tok, chat)
+        # Start Telegram listener (active mode)
+        self.listener = TelegramListener(tok, chat, idle_mode=False)
         self.listener.log.connect(self._log)
         self.listener.screenshot_requested.connect(self._send_screenshot)
         self.listener.stop_requested.connect(self._stop)
@@ -455,6 +476,20 @@ class Main(QMainWindow):
         except Exception as e:
             self._log(f"Screenshot error: {e}", "err")
     
+    def _start_idle_listener(self):
+        """Start listener for !start command when monitoring is stopped"""
+        tok, chat = self.cfg.get("token", ""), self.cfg.get("chat", "")
+        if tok and chat:
+            self.idle_listener = TelegramListener(tok, chat, idle_mode=True)
+            self.idle_listener.log.connect(self._log)
+            self.idle_listener.start_requested.connect(self._start)
+            self.idle_listener.start()
+    
+    def _stop_idle_listener(self):
+        if self.idle_listener:
+            self.idle_listener.stop()
+            self.idle_listener = None
+    
     def _stop(self):
         if self.mon: self.mon.stop(); self.mon = None
         if self.listener: self.listener.stop(); self.listener = None
@@ -463,8 +498,14 @@ class Main(QMainWindow):
         self.tok.setEnabled(True); self.chat.setEnabled(True); self.testb.setEnabled(True)
         self.dot.setStyleSheet("color:#888888;font-size:12px;")
         self.st.setText("Idle"); self.st.setStyleSheet("color:#cccccc;font-size:12px;")
+        # Restart idle listener to listen for !start
+        self._start_idle_listener()
     
-    def closeEvent(self, e): self._stop(); Config.save(self.cfg); e.accept()
+    def closeEvent(self, e):
+        self._stop_idle_listener()
+        self._stop()
+        Config.save(self.cfg)
+        e.accept()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
