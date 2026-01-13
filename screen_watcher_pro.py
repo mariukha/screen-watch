@@ -26,9 +26,13 @@ class Config:
         try:
             with open(CONFIG_FILE, 'r') as f:
                 c = json.load(f)
+                # Migrate old single region to regions list
+                regions = c.get("regions", [])
+                if not regions and c.get("region"):
+                    regions = [c.get("region")]
                 return {"token": c.get("token", DEFAULT_TOKEN), "chat": c.get("chat", DEFAULT_CHAT),
-                        "threshold": c.get("threshold", 50000), "interval": c.get("interval", 1.0), "region": c.get("region")}
-        except: return {"token": DEFAULT_TOKEN, "chat": DEFAULT_CHAT, "threshold": 50000, "interval": 1.0, "region": None}
+                        "threshold": c.get("threshold", 50000), "interval": c.get("interval", 1.0), "regions": regions}
+        except: return {"token": DEFAULT_TOKEN, "chat": DEFAULT_CHAT, "threshold": 50000, "interval": 1.0, "regions": []}
     
     @staticmethod
     def save(d):
@@ -112,44 +116,59 @@ class TelegramListener(QThread):
 
 class Monitor(QThread):
     log = pyqtSignal(str, str)
-    changed = pyqtSignal(object, int)
+    changed = pyqtSignal(object, int, int)  # img, score, zone_index
     status = pyqtSignal(str)
     
-    def __init__(self, token, chat, region, threshold, interval):
+    def __init__(self, token, chat, regions, threshold, interval):
         super().__init__()
-        self.token, self.chat, self.region = token, chat, tuple(region) if region else None
-        self.threshold, self.interval, self.running, self.last, self.count = threshold, interval, True, None, 0
+        self.token, self.chat = token, chat
+        self.regions = [tuple(r) for r in regions] if regions else []
+        self.threshold, self.interval, self.running = threshold, interval, True
+        self.last_images = {}  # Store last image per region index
+        self.count = 0
         
     def run(self):
-        self.log.emit(f"Started | Region: {self.region} | Threshold: {self.threshold:,}", "ok")
-        try: self.last = screenshot(self.region)
-        except Exception as e: self.log.emit(f"Capture error: {e}", "err"); return
+        self.log.emit(f"Started | Zones: {len(self.regions)} | Threshold: {self.threshold:,}", "ok")
+        # Initialize last images for all regions
+        for i, region in enumerate(self.regions):
+            try:
+                self.last_images[i] = screenshot(region)
+                self.log.emit(f"Zone {i+1}: {region}", "info")
+            except Exception as e:
+                self.log.emit(f"Zone {i+1} capture error: {e}", "err")
+                return
         n = 0
         while self.running:
             time.sleep(self.interval)
             if not self.running: break
             try:
-                cur = screenshot(self.region)
-                n += 1
-                diff = np.array(ImageChops.difference(self.last, cur), dtype=np.int64)
-                score = int(np.sum(diff))
-                if n % 5 == 0: self.status.emit(f"Active | #{n} | diff: {score:,}")
-                if score > self.threshold:
-                    self.count += 1
-                    self.log.emit(f"CHANGE #{self.count} | Score: {score:,}", "warn")
-                    if self.send(cur, score): self.log.emit("Sent to Telegram", "ok")
-                    else: self.log.emit("Failed to send", "err")
-                    self.last = cur.copy()
-                    self.changed.emit(cur, score)
-            except Exception as e: self.log.emit(f"Error: {e}", "err"); time.sleep(2)
+                for i, region in enumerate(self.regions):
+                    cur = screenshot(region)
+                    n += 1
+                    diff = np.array(ImageChops.difference(self.last_images[i], cur), dtype=np.int64)
+                    score = int(np.sum(diff))
+                    if n % (5 * len(self.regions)) == 0:
+                        self.status.emit(f"Active | #{n} | zones: {len(self.regions)}")
+                    if score > self.threshold:
+                        self.count += 1
+                        self.log.emit(f"CHANGE Zone {i+1} #{self.count} | Score: {score:,}", "warn")
+                        if self.send(cur, score, i+1):
+                            self.log.emit(f"Zone {i+1} sent to Telegram", "ok")
+                        else:
+                            self.log.emit(f"Zone {i+1} failed to send", "err")
+                        self.last_images[i] = cur.copy()
+                        self.changed.emit(cur, score, i)
+            except Exception as e:
+                self.log.emit(f"Error: {e}", "err")
+                time.sleep(2)
     
-    def send(self, img, score):
+    def send(self, img, score, zone_num):
         try:
             bio = BytesIO()
             img.save(bio, 'PNG')
             bio.seek(0)
             r = requests.post(f"https://api.telegram.org/bot{self.token}/sendPhoto",
-                data={'chat_id': self.chat, 'caption': f"⚡ Change | Score: {score:,} | {datetime.now().strftime('%H:%M:%S')}"},
+                data={'chat_id': self.chat, 'caption': f"⚡ Zone {zone_num} Change | Score: {score:,} | {datetime.now().strftime('%H:%M:%S')}"},
                 files={'photo': ('s.png', bio, 'image/png')}, timeout=30)
             return r.status_code == 200
         except: return False
@@ -211,9 +230,10 @@ class Preview(QFrame):
         super().__init__()
         self.setFixedSize(300, 180)
         self.pm = None
+        self.zone_label = ""
         self.setStyleSheet("background:#1a1a1a;border:1px solid #333;border-radius:8px;")
-    def set(self, img): self.pm = to_pixmap(img); self.update()
-    def clear(self): self.pm = None; self.update()
+    def set(self, img, label=""): self.pm = to_pixmap(img); self.zone_label = label; self.update()
+    def clear(self): self.pm = None; self.zone_label = ""; self.update()
     def paintEvent(self, e):
         super().paintEvent(e)
         p = QPainter(self)
@@ -221,22 +241,27 @@ class Preview(QFrame):
         if self.pm:
             s = self.pm.scaled(self.size() - QSize(16,16), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             p.drawPixmap((self.width()-s.width())//2, (self.height()-s.height())//2, s)
+            if self.zone_label:
+                p.setPen(QColor("#4ec9b0"))
+                p.setFont(QFont("Menlo", 10, QFont.Weight.Bold))
+                p.drawText(8, 18, self.zone_label)
         else: p.setPen(QColor("#555")); p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No preview")
 
 class Main(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.setMinimumSize(500, 780)
-        self.resize(500, 820)
+        self.setMinimumSize(500, 850)
+        self.resize(500, 900)
         self.cfg = Config.load()
         self.mon = None
         self.sel = None
         self.listener = None
         self.idle_listener = None
+        self.current_zone_idx = 0  # For cycling through zones in preview
         self._ui()
         self._tray()
-        self._region()
+        self._update_regions_display()
         self._start_idle_listener()
     
     def _ui(self):
@@ -297,7 +322,7 @@ class Main(QMainWindow):
         chat_layout.addWidget(self.testb)
         layout.addLayout(chat_layout)
 
-        layout.addWidget(QLabel("Monitor Region", objectName="header_reg"))
+        layout.addWidget(QLabel("Monitor Regions", objectName="header_reg"))
         self.findChild(QLabel, "header_reg").setProperty("class", "header")
 
         self.pv = Preview()
@@ -307,13 +332,41 @@ class Main(QMainWindow):
         pv_layout.addStretch()
         layout.addLayout(pv_layout)
 
-        self.rl = QLabel("No region selected")
+        self.rl = QLabel("No regions selected")
         self.rl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.rl)
 
-        self.selb = QPushButton("Select Region")
+        # Zone navigation buttons
+        zone_nav_layout = QHBoxLayout()
+        self.prev_zone_btn = QPushButton("◀")
+        self.prev_zone_btn.setFixedWidth(40)
+        self.prev_zone_btn.clicked.connect(self._prev_zone)
+        self.zone_indicator = QLabel("Zone 0/0")
+        self.zone_indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.next_zone_btn = QPushButton("▶")
+        self.next_zone_btn.setFixedWidth(40)
+        self.next_zone_btn.clicked.connect(self._next_zone)
+        zone_nav_layout.addWidget(self.prev_zone_btn)
+        zone_nav_layout.addStretch()
+        zone_nav_layout.addWidget(self.zone_indicator)
+        zone_nav_layout.addStretch()
+        zone_nav_layout.addWidget(self.next_zone_btn)
+        layout.addLayout(zone_nav_layout)
+
+        # Region buttons
+        reg_btn_layout = QHBoxLayout()
+        self.selb = QPushButton("+ Add Zone")
         self.selb.clicked.connect(self._sel)
-        layout.addWidget(self.selb)
+        self.clearb = QPushButton("Clear All")
+        self.clearb.clicked.connect(self._clear_all_zones)
+        self.clearb.setStyleSheet("background-color: #6e3630;")
+        self.remove_zone_btn = QPushButton("Remove Zone")
+        self.remove_zone_btn.clicked.connect(self._remove_current_zone)
+        self.remove_zone_btn.setStyleSheet("background-color: #4a3030;")
+        reg_btn_layout.addWidget(self.selb)
+        reg_btn_layout.addWidget(self.remove_zone_btn)
+        reg_btn_layout.addWidget(self.clearb)
+        layout.addLayout(reg_btn_layout)
 
         layout.addWidget(QLabel("Settings", objectName="header_set"))
         self.findChild(QLabel, "header_set").setProperty("class", "header")
@@ -377,17 +430,59 @@ class Main(QMainWindow):
         self.logw.append(f'<span style="color:#888888">[{datetime.now().strftime("%H:%M:%S")}]</span> <span style="color:{c}">{msg}</span>')
         self.logw.verticalScrollBar().setValue(self.logw.verticalScrollBar().maximum())
     
-    def _region(self):
-        r = self.cfg.get("region")
-        if r:
-            self.rl.setText(f"({r[0]}, {r[1]}) • {r[2]}×{r[3]}")
+    def _update_regions_display(self):
+        regions = self.cfg.get("regions", [])
+        count = len(regions)
+        if count > 0:
+            self.rl.setText(f"{count} zone(s) selected")
             self.rl.setStyleSheet("color:#4ec9b0;padding:8px;")
-            try: self.pv.set(screenshot(tuple(r)))
-            except: pass
+            if self.current_zone_idx >= count:
+                self.current_zone_idx = count - 1
+            self._show_current_zone()
         else:
-            self.rl.setText("No region selected")
+            self.rl.setText("No regions selected")
             self.rl.setStyleSheet("color:#888888;padding:8px;")
             self.pv.clear()
+            self.zone_indicator.setText("Zone 0/0")
+            self.current_zone_idx = 0
+    
+    def _show_current_zone(self):
+        regions = self.cfg.get("regions", [])
+        if regions and 0 <= self.current_zone_idx < len(regions):
+            r = regions[self.current_zone_idx]
+            self.zone_indicator.setText(f"Zone {self.current_zone_idx + 1}/{len(regions)}")
+            try:
+                self.pv.set(screenshot(tuple(r)), f"Zone {self.current_zone_idx + 1}: {r[2]}×{r[3]}")
+            except: pass
+        else:
+            self.zone_indicator.setText("Zone 0/0")
+            self.pv.clear()
+    
+    def _prev_zone(self):
+        regions = self.cfg.get("regions", [])
+        if regions:
+            self.current_zone_idx = (self.current_zone_idx - 1) % len(regions)
+            self._show_current_zone()
+    
+    def _next_zone(self):
+        regions = self.cfg.get("regions", [])
+        if regions:
+            self.current_zone_idx = (self.current_zone_idx + 1) % len(regions)
+            self._show_current_zone()
+    
+    def _remove_current_zone(self):
+        regions = self.cfg.get("regions", [])
+        if regions and 0 <= self.current_zone_idx < len(regions):
+            removed = regions.pop(self.current_zone_idx)
+            self.cfg["regions"] = regions
+            self._log(f"Removed zone {self.current_zone_idx + 1}", "info")
+            self._update_regions_display()
+    
+    def _clear_all_zones(self):
+        self.cfg["regions"] = []
+        self.current_zone_idx = 0
+        self._log("All zones cleared", "info")
+        self._update_regions_display()
     
     def _sel(self):
         self.sel = Selector()
@@ -398,9 +493,12 @@ class Main(QMainWindow):
         QTimer.singleShot(250, self.sel.take_screenshot)
     
     def _on_sel(self, r):
-        self.cfg["region"] = list(r)
-        self._region()
-        self._log(f"Region: {r}", "ok")
+        if "regions" not in self.cfg:
+            self.cfg["regions"] = []
+        self.cfg["regions"].append(list(r))
+        self.current_zone_idx = len(self.cfg["regions"]) - 1
+        self._update_regions_display()
+        self._log(f"Added zone {len(self.cfg['regions'])}: {r}", "ok")
         self.show(); self.activateWindow()
     
     def _on_cancel(self):
@@ -420,9 +518,9 @@ class Main(QMainWindow):
         except Exception as e: self._log(f"Error: {e}", "err"); QMessageBox.critical(self, "Error", str(e))
     
     def _start(self):
-        r = self.cfg.get("region")
-        if not r:
-            self._log("Cannot start: no region selected", "err")
+        regions = self.cfg.get("regions", [])
+        if not regions:
+            self._log("Cannot start: no regions selected", "err")
             return
         tok, chat = self.tok.text().strip() or self.cfg.get("token", ""), self.chat.text().strip() or self.cfg.get("chat", "")
         if not tok or not chat:
@@ -435,10 +533,10 @@ class Main(QMainWindow):
         self.cfg["token"], self.cfg["chat"] = tok, chat
         self.cfg["threshold"], self.cfg["interval"] = self.thr.value(), self.intv.value()
         Config.save(self.cfg)
-        self.mon = Monitor(tok, chat, r, self.cfg["threshold"], self.cfg["interval"])
+        self.mon = Monitor(tok, chat, regions, self.cfg["threshold"], self.cfg["interval"])
         self.mon.log.connect(self._log)
         self.mon.status.connect(lambda s: self.st.setText(s))
-        self.mon.changed.connect(lambda img, _: self.pv.set(img))
+        self.mon.changed.connect(lambda img, _, idx: self.pv.set(img, f"Zone {idx+1}"))
         self.mon.start()
         
         # Start Telegram listener (active mode)
@@ -449,32 +547,43 @@ class Main(QMainWindow):
         self.listener.start()
         
         self.startb.setEnabled(False); self.stopb.setEnabled(True); self.selb.setEnabled(False)
+        self.clearb.setEnabled(False); self.remove_zone_btn.setEnabled(False)
         self.tok.setEnabled(False); self.chat.setEnabled(False); self.testb.setEnabled(False)
         self.dot.setStyleSheet("color:#4ec9b0;font-size:12px;")
         self.st.setText("Active"); self.st.setStyleSheet("color:#4ec9b0;font-size:12px;")
     
     def _send_screenshot(self):
-        """Send screenshot when requested via Telegram command"""
-        r = self.cfg.get("region")
+        """Send screenshots of all zones when requested via Telegram command"""
+        regions = self.cfg.get("regions", [])
         tok, chat = self.cfg.get("token"), self.cfg.get("chat")
-        try:
-            img = screenshot(tuple(r) if r else None)
-            self.pv.set(img)
-            bio = BytesIO()
-            img.save(bio, 'PNG')
-            bio.seek(0)
-            res = requests.post(
-                f"https://api.telegram.org/bot{tok}/sendPhoto",
-                data={'chat_id': chat, 'caption': f"📸 Screenshot | {datetime.now().strftime('%H:%M:%S')}"},
-                files={'photo': ('screen.png', bio, 'image/png')},
-                timeout=30
-            )
-            if res.status_code == 200:
-                self._log("Screenshot sent via command", "ok")
-            else:
-                self._log(f"Failed to send screenshot: {res.text}", "err")
-        except Exception as e:
-            self._log(f"Screenshot error: {e}", "err")
+        
+        if not regions:
+            self._log("No regions to capture", "warn")
+            return
+        
+        sent_count = 0
+        for i, r in enumerate(regions):
+            try:
+                img = screenshot(tuple(r))
+                if i == 0:
+                    self.pv.set(img, f"Zone {i+1}")
+                bio = BytesIO()
+                img.save(bio, 'PNG')
+                bio.seek(0)
+                res = requests.post(
+                    f"https://api.telegram.org/bot{tok}/sendPhoto",
+                    data={'chat_id': chat, 'caption': f"📸 Zone {i+1}/{len(regions)} | {datetime.now().strftime('%H:%M:%S')}"},
+                    files={'photo': ('screen.png', bio, 'image/png')},
+                    timeout=30
+                )
+                if res.status_code == 200:
+                    sent_count += 1
+                else:
+                    self._log(f"Zone {i+1} failed: {res.text}", "err")
+            except Exception as e:
+                self._log(f"Zone {i+1} error: {e}", "err")
+        
+        self._log(f"Screenshots sent: {sent_count}/{len(regions)}", "ok" if sent_count == len(regions) else "warn")
     
     def _start_idle_listener(self):
         """Start listener for !start command when monitoring is stopped"""
@@ -495,6 +604,7 @@ class Main(QMainWindow):
         if self.listener: self.listener.stop(); self.listener = None
         self._log("Stopped", "info")
         self.startb.setEnabled(True); self.stopb.setEnabled(False); self.selb.setEnabled(True)
+        self.clearb.setEnabled(True); self.remove_zone_btn.setEnabled(True)
         self.tok.setEnabled(True); self.chat.setEnabled(True); self.testb.setEnabled(True)
         self.dot.setStyleSheet("color:#888888;font-size:12px;")
         self.st.setText("Idle"); self.st.setStyleSheet("color:#cccccc;font-size:12px;")
